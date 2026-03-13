@@ -1,0 +1,39 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+.Python
+env/
+venv/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+.mypy_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+.vscode/
+.idea/
+
+*.log
+*.tmp
+*.bak
+
+# PyTorch checkpoints and run outputs
+*.pt
+runs/
+
+# Large datasets
+dataset/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+
