@@ -75,7 +75,9 @@ class TrainMainWindow(QMainWindow):
         self.setWindowTitle("SARCapsNet Training")
         self.resize(1020, 760)
         self.project_root = PROJECT_ROOT
+        self._initial_args = argparse.Namespace(**vars(args))
         self.process: QProcess | None = None
+        self._pending_ui_reset = False
         self._log_stream_buffer = ""
         self._total_epochs = max(1, int(args.epochs))
 
@@ -211,6 +213,10 @@ class TrainMainWindow(QMainWindow):
         self.stop_button.clicked.connect(self.stop_training)
         button_row.addWidget(self.stop_button)
 
+        self.reset_button = QPushButton("Reset UI")
+        self.reset_button.clicked.connect(self.reset_ui)
+        button_row.addWidget(self.reset_button)
+
         self.clear_log_button = QPushButton("Clear Log")
         self.clear_log_button.clicked.connect(self.clear_log)
         button_row.addWidget(self.clear_log_button)
@@ -298,6 +304,60 @@ class TrainMainWindow(QMainWindow):
         self.flags_group.setEnabled(not running)
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
+        self.reset_button.setEnabled(True)
+
+    def _cleanup_finished_process(self) -> None:
+        if self.process is None:
+            return
+        if self.process.state() != QProcess.NotRunning:
+            return
+        self.process.deleteLater()
+        self.process = None
+
+    def _apply_args_to_form(self, args: argparse.Namespace) -> None:
+        self.data_root_edit.setText(str(args.data_root))
+        self.split_edit.setText(str(args.split))
+        self.out_dir_edit.setText(str(args.out_dir))
+
+        self.limited_rate_spin.setValue(float(args.limited_rate))
+        self.seed_spin.setValue(int(args.seed))
+        self.device_combo.setCurrentText(str(args.device))
+        self.input_size_spin.setValue(int(args.input_size))
+        self.resize_mode_combo.setCurrentText(str(args.resize_mode))
+        self.epochs_spin.setValue(int(args.epochs))
+        self.batch_size_spin.setValue(int(args.batch_size))
+        self.lr_spin.setValue(float(args.lr))
+        self.lr_gamma_spin.setValue(float(args.lr_gamma))
+        self.num_workers_spin.setValue(int(args.num_workers))
+        self.grad_clip_spin.setValue(float(args.grad_clip))
+        self.run_name_edit.setText(str(args.run_name))
+
+        self.amp_check.setChecked(bool(args.amp))
+        self.detect_anomaly_check.setChecked(bool(args.detect_anomaly))
+        self.debug_finite_check.setChecked(bool(args.debug_finite))
+
+    def _perform_ui_reset(self) -> None:
+        if self.process is not None and self.process.state() != QProcess.NotRunning:
+            return
+
+        self._pending_ui_reset = False
+        self._cleanup_finished_process()
+        self._set_running(False)
+        self._apply_args_to_form(self._initial_args)
+        self._log_stream_buffer = ""
+        self._reset_progress(max(1, int(self.epochs_spin.value())))
+        self.status_label.setText("UI reset. Ready to start training.")
+        self._append_log("[GUI] UI reset to initial options.\n")
+
+    def reset_ui(self) -> None:
+        if self.process is not None and self.process.state() != QProcess.NotRunning:
+            self._pending_ui_reset = True
+            self._append_log("[GUI] UI reset requested. Stopping training first...\n")
+            self.status_label.setText("Reset requested. Stopping training...")
+            self.stop_training()
+            return
+
+        self._perform_ui_reset()
 
     def _append_log(self, text: str) -> None:
         self.log_view.moveCursor(QTextCursor.End)
@@ -410,6 +470,7 @@ class TrainMainWindow(QMainWindow):
     def start_training(self) -> None:
         if self.process is not None and self.process.state() != QProcess.NotRunning:
             return
+        self._pending_ui_reset = False
 
         if not TRAIN_SCRIPT.exists():
             self.show_error(f"Training script not found:\n{TRAIN_SCRIPT}")
@@ -508,6 +569,9 @@ class TrainMainWindow(QMainWindow):
                 f"\n[GUI] Training stopped (exit_code={exit_code}, exit_status={int(exit_status)}).\n"
             )
         self._set_running(False)
+        if self._pending_ui_reset:
+            self._pending_ui_reset = False
+            self._perform_ui_reset()
         if self.process is not None:
             self.process.deleteLater()
             self.process = None
@@ -515,6 +579,12 @@ class TrainMainWindow(QMainWindow):
     def _on_error(self, error: QProcess.ProcessError) -> None:
         self._append_log(f"\n[GUI] Process error: {int(error)}\n")
         self.status_label.setText("Training process error.")
+        # Some startup/IO failures can leave controls disabled without a finish callback.
+        self._cleanup_finished_process()
+        if self.process is None:
+            self._set_running(False)
+            if self._pending_ui_reset:
+                self._perform_ui_reset()
 
     def show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Error", message)
