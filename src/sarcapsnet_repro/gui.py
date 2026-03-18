@@ -4,8 +4,9 @@ import argparse
 import sys
 from pathlib import Path
 
+import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -31,12 +32,14 @@ from .predict import SARCapsPredictor, find_latest_checkpoint
 class MainWindow(QMainWindow):
     def __init__(self, ckpt_path: Path | None = None, device: str = "auto") -> None:
         super().__init__()
-        self.setWindowTitle("SARCapsNet 图像预测器")
+        self.setWindowTitle("SARCapsNet Inference")
         self.resize(1120, 680)
 
         self.device_name = device
         self.predictor: SARCapsPredictor | None = None
         self.image_path: Path | None = None
+        self.original_base_pixmap: QPixmap | None = None
+        self.heatmap_base_pixmap: QPixmap | None = None
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -47,15 +50,15 @@ class MainWindow(QMainWindow):
 
         top_bar = QHBoxLayout()
         self.ckpt_edit = QLineEdit()
-        self.ckpt_edit.setPlaceholderText("选择已训练的 checkpoint: best.pt")
-        top_bar.addWidget(QLabel("Checkpoint 检查点"))
+        self.ckpt_edit.setPlaceholderText("Path to checkpoint, e.g. runs/.../best.pt")
+        top_bar.addWidget(QLabel("Checkpoint"))
         top_bar.addWidget(self.ckpt_edit, 1)
 
-        self.ckpt_button = QPushButton("选择模型")
+        self.ckpt_button = QPushButton("Browse")
         self.ckpt_button.clicked.connect(self.choose_checkpoint)
         top_bar.addWidget(self.ckpt_button)
 
-        self.reload_button = QPushButton("加载模型")
+        self.reload_button = QPushButton("Reload")
         self.reload_button.clicked.connect(self.load_predictor_from_ui)
         top_bar.addWidget(self.reload_button)
         root.addLayout(top_bar)
@@ -66,7 +69,7 @@ class MainWindow(QMainWindow):
         splitter.setSizes([540, 500])
         root.addWidget(splitter, 1)
 
-        self.status_label = QLabel("请选择模型和图像以开始推理。")
+        self.status_label = QLabel("Load a checkpoint and select an image.")
         self.status_label.setWordWrap(True)
         root.addWidget(self.status_label)
 
@@ -80,21 +83,42 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setSpacing(10)
 
-        group = QGroupBox("图像")
+        group = QGroupBox("Image")
         group_layout = QVBoxLayout(group)
+        preview_row = QHBoxLayout()
+        preview_row.setSpacing(10)
 
-        self.preview_label = QLabel("未选择图像")
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumSize(480, 480)
-        self.preview_label.setFrameShape(QFrame.StyledPanel)
-        self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        group_layout.addWidget(self.preview_label, 1)
+        left_col = QVBoxLayout()
+        left_col.addWidget(QLabel("Original"))
+        self.original_preview_label = QLabel("Select an image")
+        self.original_preview_label.setAlignment(Qt.AlignCenter)
+        self.original_preview_label.setMinimumSize(240, 240)
+        self.original_preview_label.setFrameShape(QFrame.StyledPanel)
+        self.original_preview_label.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding
+        )
+        left_col.addWidget(self.original_preview_label, 1)
 
-        self.image_path_label = QLabel("路径: -")
+        right_col = QVBoxLayout()
+        right_col.addWidget(QLabel("Heatmap Overlay"))
+        self.heatmap_preview_label = QLabel("Run prediction to show heatmap")
+        self.heatmap_preview_label.setAlignment(Qt.AlignCenter)
+        self.heatmap_preview_label.setMinimumSize(240, 240)
+        self.heatmap_preview_label.setFrameShape(QFrame.StyledPanel)
+        self.heatmap_preview_label.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding
+        )
+        right_col.addWidget(self.heatmap_preview_label, 1)
+
+        preview_row.addLayout(left_col, 1)
+        preview_row.addLayout(right_col, 1)
+        group_layout.addLayout(preview_row, 1)
+
+        self.image_path_label = QLabel("Path: -")
         self.image_path_label.setWordWrap(True)
         group_layout.addWidget(self.image_path_label)
 
-        self.image_button = QPushButton("选择图像")
+        self.image_button = QPushButton("Choose Image")
         self.image_button.clicked.connect(self.choose_image)
         group_layout.addWidget(self.image_button)
 
@@ -106,28 +130,32 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setSpacing(10)
 
-        summary_group = QGroupBox("预测结果")
+        summary_group = QGroupBox("Prediction Summary")
         summary_layout = QGridLayout(summary_group)
-        summary_layout.addWidget(QLabel("类别"), 0, 0)
+        summary_layout.addWidget(QLabel("Class"), 0, 0)
         self.pred_class_label = QLabel("-")
         self.pred_class_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         summary_layout.addWidget(self.pred_class_label, 0, 1)
 
-        summary_layout.addWidget(QLabel("置信度"), 1, 0)
+        summary_layout.addWidget(QLabel("Confidence"), 1, 0)
         self.confidence_label = QLabel("-")
         summary_layout.addWidget(self.confidence_label, 1, 1)
 
-        summary_layout.addWidget(QLabel("设备"), 2, 0)
+        summary_layout.addWidget(QLabel("Device"), 2, 0)
         self.device_label = QLabel("-")
         summary_layout.addWidget(self.device_label, 2, 1)
 
-        summary_layout.addWidget(QLabel("输入"), 3, 0)
+        summary_layout.addWidget(QLabel("Model Input"), 3, 0)
         self.input_label = QLabel("-")
         summary_layout.addWidget(self.input_label, 3, 1)
 
+        summary_layout.addWidget(QLabel("Heatmap peak"), 4, 0)
+        self.attention_peak_label = QLabel("-")
+        summary_layout.addWidget(self.attention_peak_label, 4, 1)
+
         layout.addWidget(summary_group)
 
-        details_group = QGroupBox("Top 结果")
+        details_group = QGroupBox("Top Predictions")
         details_layout = QVBoxLayout(details_group)
         self.result_text = QPlainTextEdit()
         self.result_text.setReadOnly(True)
@@ -139,7 +167,7 @@ class MainWindow(QMainWindow):
     def choose_checkpoint(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
             self,
-            "选择 Checkpoint 文件",
+            "Select Checkpoint",
             str(Path.cwd()),
             "PyTorch Checkpoint (*.pt)",
         )
@@ -151,7 +179,7 @@ class MainWindow(QMainWindow):
     def load_predictor_from_ui(self) -> None:
         ckpt_text = self.ckpt_edit.text().strip()
         if not ckpt_text:
-            self.show_error("请先选择一个 checkpoint 文件。")
+            self.show_error("Please provide a checkpoint path.")
             return
         self.load_predictor(Path(ckpt_text))
 
@@ -160,15 +188,15 @@ class MainWindow(QMainWindow):
             self.predictor = SARCapsPredictor(ckpt_path, device=self.device_name)
         except Exception as exc:  # noqa: BLE001
             self.predictor = None
-            self.show_error(f"模型加载失败：\n{exc}")
-            self.status_label.setText("模型加载失败。")
+            self.show_error(f"Failed to load checkpoint:\n{exc}")
+            self.status_label.setText("Failed to load checkpoint.")
             return
 
         self.device_label.setText(self.predictor.device.type)
         self.input_label.setText(
             f"{self.predictor.input_size} x {self.predictor.input_size} ({self.predictor.resize_mode})"
         )
-        self.status_label.setText(f"模型已加载: {ckpt_path}")
+        self.status_label.setText(f"Checkpoint loaded: {ckpt_path}")
 
         if self.image_path is not None:
             self.run_prediction()
@@ -176,7 +204,7 @@ class MainWindow(QMainWindow):
     def choose_image(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
             self,
-            "选择图像",
+            "Select Image",
             str(Path.cwd()),
             "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)",
         )
@@ -184,40 +212,126 @@ class MainWindow(QMainWindow):
             return
 
         self.image_path = Path(filename)
-        self.image_path_label.setText(f"路径: {self.image_path}")
+        self.image_path_label.setText(f"Path: {self.image_path}")
         self.update_preview(self.image_path)
+        self.heatmap_base_pixmap = None
+        self.refresh_preview_pixmaps()
         self.run_prediction()
 
     def update_preview(self, image_path: Path) -> None:
         pixmap = QPixmap(str(image_path))
         if pixmap.isNull():
-            self.preview_label.setText("无法预览该图像")
+            self.original_base_pixmap = None
+            self.refresh_preview_pixmaps()
             return
-        scaled = pixmap.scaled(
-            self.preview_label.size(),
+        self.set_original_pixmap(pixmap)
+
+    def set_original_pixmap(self, pixmap: QPixmap) -> None:
+        self.original_base_pixmap = pixmap
+        self.refresh_preview_pixmaps()
+
+    def set_heatmap_pixmap(self, pixmap: QPixmap) -> None:
+        self.heatmap_base_pixmap = pixmap
+        self.refresh_preview_pixmaps()
+
+    @staticmethod
+    def _refresh_preview_label(
+        label: QLabel,
+        base_pixmap: QPixmap | None,
+        empty_text: str,
+    ) -> None:
+        if base_pixmap is None:
+            label.clear()
+            label.setText(empty_text)
+            return
+
+        scaled = base_pixmap.scaled(
+            label.size(),
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation,
         )
-        self.preview_label.setPixmap(scaled)
+        label.clear()
+        label.setPixmap(scaled)
+
+    def refresh_preview_pixmaps(self) -> None:
+        self._refresh_preview_label(
+            self.original_preview_label,
+            self.original_base_pixmap,
+            "Select an image",
+        )
+        self._refresh_preview_label(
+            self.heatmap_preview_label,
+            self.heatmap_base_pixmap,
+            "Run prediction to show heatmap",
+        )
+
+    @staticmethod
+    def _array_to_qpixmap(image_rgb: np.ndarray) -> QPixmap:
+        arr = np.ascontiguousarray(image_rgb.astype(np.uint8))
+        height, width = arr.shape[:2]
+        qimg = QImage(arr.data, width, height, 3 * width, QImage.Format_RGB888).copy()
+        return QPixmap.fromImage(qimg)
+
+    @staticmethod
+    def _jet_colormap(values: np.ndarray) -> np.ndarray:
+        v = np.clip(values.astype(np.float32), 0.0, 1.0)
+        r = np.clip(1.5 - np.abs(4.0 * v - 3.0), 0.0, 1.0)
+        g = np.clip(1.5 - np.abs(4.0 * v - 2.0), 0.0, 1.0)
+        b = np.clip(1.5 - np.abs(4.0 * v - 1.0), 0.0, 1.0)
+        return np.stack([r, g, b], axis=-1) * 255.0
+
+    @classmethod
+    def render_attention_overlay(
+        cls,
+        model_input_image: np.ndarray,
+        attention_map: np.ndarray,
+        peak: tuple[int, int],
+    ) -> QPixmap:
+        base = np.clip(model_input_image.astype(np.float32), 0.0, 1.0)
+        attn = np.clip(attention_map.astype(np.float32), 0.0, 1.0)
+        if base.shape != attn.shape:
+            raise ValueError(
+                f"input and heatmap shapes must match, got {base.shape} vs {attn.shape}"
+            )
+
+        base_rgb = np.repeat((base * 255.0).astype(np.float32)[..., None], 3, axis=2)
+        heat_rgb = cls._jet_colormap(attn).astype(np.float32)
+        alpha = (0.2 + 0.55 * attn)[..., None]
+        overlay = np.clip((1.0 - alpha) * base_rgb + alpha * heat_rgb, 0.0, 255.0)
+
+        h, w = attn.shape
+        peak_y = int(np.clip(peak[0], 0, h - 1))
+        peak_x = int(np.clip(peak[1], 0, w - 1))
+        radius = max(2, min(h, w) // 12)
+
+        overlay[
+            max(peak_y - 1, 0) : min(peak_y + 2, h),
+            max(peak_x - radius, 0) : min(peak_x + radius + 1, w),
+        ] = [255.0, 255.0, 255.0]
+        overlay[
+            max(peak_y - radius, 0) : min(peak_y + radius + 1, h),
+            max(peak_x - 1, 0) : min(peak_x + 2, w),
+        ] = [255.0, 255.0, 255.0]
+
+        return cls._array_to_qpixmap(overlay.astype(np.uint8))
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
-        if self.image_path is not None:
-            self.update_preview(self.image_path)
+        self.refresh_preview_pixmaps()
 
     def run_prediction(self) -> None:
         if self.predictor is None:
-            self.status_label.setText("请先选择并加载模型。")
+            self.status_label.setText("Please load a checkpoint first.")
             return
         if self.image_path is None:
-            self.status_label.setText("请先选择图像。")
+            self.status_label.setText("Please select an image first.")
             return
 
         try:
             result = self.predictor.predict_image(self.image_path)
         except Exception as exc:  # noqa: BLE001
-            self.show_error(f"推理失败：\n{exc}")
-            self.status_label.setText("推理失败。")
+            self.show_error(f"Prediction failed:\n{exc}")
+            self.status_label.setText("Prediction failed.")
             return
 
         self.pred_class_label.setText(
@@ -226,6 +340,22 @@ class MainWindow(QMainWindow):
         self.confidence_label.setText(f"{result.confidence:.2%}")
         self.device_label.setText(result.device)
 
+        peak_y, peak_x = result.attention_peak
+        self.attention_peak_label.setText(f"(x={peak_x}, y={peak_y})")
+
+        try:
+            overlay = self.render_attention_overlay(
+                result.model_input_image,
+                result.attention_map,
+                result.attention_peak,
+            )
+        except Exception:
+            # Keep UI responsive even if heatmap rendering fails unexpectedly.
+            self.heatmap_base_pixmap = None
+            self.refresh_preview_pixmaps()
+        else:
+            self.set_heatmap_pixmap(overlay)
+
         lines = []
         for row in result.probabilities:
             class_name = str(row["class_name"])
@@ -233,10 +363,12 @@ class MainWindow(QMainWindow):
             prob = float(row["probability"])
             lines.append(f"{class_name:<12} idx={class_index}  prob={prob:.4f}")
         self.result_text.setPlainText("\n".join(lines))
-        self.status_label.setText(f"预测结果：{result.image_path.name} 为 {result.predicted_class}")
+        self.status_label.setText(
+            f"Prediction done: {result.image_path.name} -> {result.predicted_class}"
+        )
 
     def show_error(self, message: str) -> None:
-        QMessageBox.critical(self, "错误", message)
+        QMessageBox.critical(self, "Error", message)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

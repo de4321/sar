@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from .data.sar_acd_dataset import _resize_square
@@ -43,6 +44,9 @@ class PredictionResult:
     confidence: float
     probabilities: list[dict[str, float | str]]
     device: str
+    model_input_image: np.ndarray
+    attention_map: np.ndarray
+    attention_peak: tuple[int, int]
 
 
 class SARCapsPredictor:
@@ -102,10 +106,56 @@ class SARCapsPredictor:
         tensor = tensor.unsqueeze(0).unsqueeze(0)
         return tensor
 
+    @staticmethod
+    def _attention_from_feature(
+        feature: torch.Tensor | None,
+        target_hw: int,
+    ) -> tuple[np.ndarray, tuple[int, int]]:
+        if feature is None or feature.ndim != 4 or feature.shape[0] == 0:
+            fallback = np.zeros((target_hw, target_hw), dtype=np.float32)
+            center = (target_hw // 2, target_hw // 2)
+            return fallback, center
+
+        with torch.no_grad():
+            heat = feature[0].abs().mean(dim=0, keepdim=True).unsqueeze(0)
+            heat = F.interpolate(
+                heat,
+                size=(target_hw, target_hw),
+                mode="bilinear",
+                align_corners=False,
+            )[0, 0]
+            min_v = torch.min(heat)
+            max_v = torch.max(heat)
+            denom = max_v - min_v
+            if float(denom.item()) > 1e-8:
+                heat = (heat - min_v) / denom
+            else:
+                heat = torch.zeros_like(heat)
+
+            flat_idx = int(torch.argmax(heat).item())
+            width = int(heat.shape[1])
+            peak = (flat_idx // width, flat_idx % width)
+            return heat.cpu().numpy().astype(np.float32), peak
+
     @torch.no_grad()
     def predict_image(self, image_path: Path, top_k: int = 3) -> PredictionResult:
         x = self.preprocess_image(image_path).to(self.device)
-        logits, _, _ = self.model(x, y=None)
+        sa_feature: torch.Tensor | None = None
+
+        def _capture_sa(
+            _module: torch.nn.Module,
+            _inputs: tuple[torch.Tensor, ...],
+            output: torch.Tensor,
+        ) -> None:
+            nonlocal sa_feature
+            sa_feature = output.detach()
+
+        handle = self.model.sa.register_forward_hook(_capture_sa)
+        try:
+            logits, _, _ = self.model(x, y=None)
+        finally:
+            handle.remove()
+
         probs = torch.softmax(logits[0], dim=0)
         top_probs, top_indices = torch.topk(probs, k=min(int(top_k), len(self.classes)))
 
@@ -123,6 +173,12 @@ class SARCapsPredictor:
                 }
             )
 
+        model_input = x[0, 0].detach().cpu().numpy().astype(np.float32)
+        attention_map, attention_peak = self._attention_from_feature(
+            sa_feature,
+            target_hw=self.input_size,
+        )
+
         return PredictionResult(
             image_path=Path(image_path),
             predicted_index=pred_index,
@@ -130,4 +186,7 @@ class SARCapsPredictor:
             confidence=confidence,
             probabilities=rows,
             device=str(self.device),
+            model_input_image=model_input,
+            attention_map=attention_map,
+            attention_peak=attention_peak,
         )
